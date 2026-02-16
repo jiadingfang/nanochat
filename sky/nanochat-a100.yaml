@@ -1,0 +1,125 @@
+# SkyPilot config for nanochat GPT-2 speedrun on RunPod 8xA100-80GB
+#
+# Prerequisites:
+#   pip install "skypilot-nightly[runpod]" "runpod>=1.6"
+#   runpod config   # paste RunPod API key
+#   sky check       # verify RunPod shows green
+#
+# Launch:
+#   sky launch -c nanochat-gpt2-a100 --idle-minutes-to-autostop 30 sky/nanochat-a100.yaml
+#
+# Monitor:
+#   sky logs nanochat-gpt2-a100
+#   sky ssh nanochat-gpt2-a100
+#
+# Teardown:
+#   sky down nanochat-gpt2-a100
+#
+# Cost: ~$12/hr, ~5-6 hours runtime => ~$66-78 total
+
+resources:
+  cloud: runpod
+  accelerators: A100-80GB:8
+  disk_size: 200
+
+envs:
+  WANDB_API_KEY: # paste your key or pass via --env
+  HF_TOKEN: # paste your token or pass via --env
+  HF_REPO_ID: # e.g. "username/nanochat-gpt2"
+  OMP_NUM_THREADS: "1"
+
+workdir: .
+
+setup: |
+  set -euo pipefail
+
+  # Install uv
+  command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+
+  # Create venv and install dependencies
+  cd ~/sky_workdir
+  [ -d ".venv" ] || uv venv
+  uv sync --extra gpu
+  source .venv/bin/activate
+
+  # Install huggingface-cli for final upload
+  pip install huggingface-hub
+
+  # Download dataset shards (370 needed for full pretraining)
+  python -m nanochat.dataset -n 370
+
+  # Download SFT identity conversations
+  export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+  mkdir -p "$NANOCHAT_BASE_DIR"
+  curl -L -o "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" \
+    https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+
+run: |
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$PATH"
+  cd ~/sky_workdir
+  source .venv/bin/activate
+  export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+
+  WANDB_RUN="nanochat-a100"
+  NUM_GPUS=${SKYPILOT_NUM_GPUS_PER_NODE:-8}
+
+  # Log in to wandb and HuggingFace
+  if [ -n "$WANDB_API_KEY" ]; then
+    wandb login "$WANDB_API_KEY"
+  else
+    WANDB_RUN=dummy
+  fi
+  if [ -n "$HF_TOKEN" ]; then
+    huggingface-cli login --token "$HF_TOKEN"
+  fi
+
+  # --- Full pipeline ---
+
+  # 1. Reset report
+  python -m nanochat.report reset
+
+  # 2. Tokenizer
+  python -m scripts.tok_train
+  python -m scripts.tok_eval
+
+  # 3. Base model pretraining (no --fp8: A100 is Ampere, no FP8 support)
+  torchrun --standalone --nproc_per_node=$NUM_GPUS \
+    -m scripts.base_train -- \
+    --depth=26 \
+    --target-param-data-ratio=8.25 \
+    --device-batch-size=16 \
+    --run=$WANDB_RUN
+
+  # 4. Base model evaluation
+  torchrun --standalone --nproc_per_node=$NUM_GPUS \
+    -m scripts.base_eval -- \
+    --device-batch-size=16
+
+  # 5. SFT (identity conversations already downloaded in setup)
+  torchrun --standalone --nproc_per_node=$NUM_GPUS \
+    -m scripts.chat_sft -- \
+    --device-batch-size=16 \
+    --run=$WANDB_RUN
+
+  # 6. Chat evaluation
+  torchrun --standalone --nproc_per_node=$NUM_GPUS \
+    -m scripts.chat_eval -- \
+    -i sft
+
+  # 7. Generate report
+  python -m nanochat.report generate
+
+  # 8. Upload artifacts
+  if [ -n "${HF_REPO_ID:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
+    echo "Uploading to HuggingFace Hub: $HF_REPO_ID"
+    huggingface-cli upload "$HF_REPO_ID" "$NANOCHAT_BASE_DIR/"
+  fi
+
+  if [ -n "${WANDB_API_KEY:-}" ]; then
+    echo "Uploading model as wandb artifact"
+    wandb artifact put --name nanochat-gpt2-model --type model "$NANOCHAT_BASE_DIR/"
+  fi
+
+  echo "=== nanochat speedrun complete ==="
