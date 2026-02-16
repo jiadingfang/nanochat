@@ -6,7 +6,11 @@
 #   sky check       # verify RunPod shows green
 #
 # Launch:
-#   sky launch -c nanochat-gpt2-a100 --idle-minutes-to-autostop 30 sky/nanochat-a100.yaml
+#   sky launch -c nanochat-gpt2-a100 --idle-minutes-to-autostop 10 \
+#     --env WANDB_API_KEY=<your-wandb-key> \
+#     --env HF_TOKEN=<your-hf-token> \
+#     --env HF_REPO_ID=<yourusername/nanochat-gpt2> \
+#     sky/nanochat-a100.yaml
 #
 # Monitor:
 #   sky logs nanochat-gpt2-a100
@@ -75,6 +79,15 @@ run: |
     huggingface-cli login --token "$HF_TOKEN"
   fi
 
+  # Helper: upload current artifacts to HF
+  upload_to_hf() {
+    local stage="$1"
+    if [ -n "${HF_REPO_ID:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
+      echo "=== Uploading artifacts after $stage ==="
+      huggingface-cli upload "$HF_REPO_ID" "$NANOCHAT_BASE_DIR/" --commit-message "after $stage"
+    fi
+  }
+
   # --- Full pipeline ---
 
   # 1. Reset report
@@ -83,6 +96,7 @@ run: |
   # 2. Tokenizer
   python -m scripts.tok_train
   python -m scripts.tok_eval
+  upload_to_hf "tokenizer"
 
   # 3. Base model pretraining (no --fp8: A100 is Ampere, no FP8 support)
   torchrun --standalone --nproc_per_node=$NUM_GPUS \
@@ -91,17 +105,20 @@ run: |
     --target-param-data-ratio=8.25 \
     --device-batch-size=16 \
     --run=$WANDB_RUN
+  upload_to_hf "base_train"
 
   # 4. Base model evaluation
   torchrun --standalone --nproc_per_node=$NUM_GPUS \
     -m scripts.base_eval -- \
     --device-batch-size=16
+  upload_to_hf "base_eval"
 
   # 5. SFT (identity conversations already downloaded in setup)
   torchrun --standalone --nproc_per_node=$NUM_GPUS \
     -m scripts.chat_sft -- \
     --device-batch-size=16 \
     --run=$WANDB_RUN
+  upload_to_hf "chat_sft"
 
   # 6. Chat evaluation
   torchrun --standalone --nproc_per_node=$NUM_GPUS \
@@ -111,11 +128,8 @@ run: |
   # 7. Generate report
   python -m nanochat.report generate
 
-  # 8. Upload artifacts
-  if [ -n "${HF_REPO_ID:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
-    echo "Uploading to HuggingFace Hub: $HF_REPO_ID"
-    huggingface-cli upload "$HF_REPO_ID" "$NANOCHAT_BASE_DIR/"
-  fi
+  # 8. Final upload
+  upload_to_hf "final"
 
   if [ -n "${WANDB_API_KEY:-}" ]; then
     echo "Uploading model as wandb artifact"
