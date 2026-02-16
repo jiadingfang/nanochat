@@ -1,4 +1,4 @@
-# SkyPilot config for nanochat GPT-2 speedrun on RunPod 8xA100-80GB
+# SkyPilot config for nanochat GPT-2 speedrun (default: 8xH100)
 #
 # Prerequisites:
 #   pip install "skypilot-nightly[runpod]" "runpod>=1.6"
@@ -6,24 +6,24 @@
 #   sky check       # verify RunPod shows green
 #
 # Launch:
-#   sky launch -c nanochat-gpt2-a100 --idle-minutes-to-autostop 10 \
+#   sky launch -c nanochat-cluster --idle-minutes-to-autostop 10 \
 #     --env WANDB_API_KEY=<your-wandb-key> \
 #     --env HF_TOKEN=<your-hf-token> \
 #     --env HF_REPO_ID=<yourusername/nanochat-gpt2> \
-#     sky/nanochat-a100.yaml
+#     sky/nanochat.yaml
 #
 # Monitor:
-#   sky logs nanochat-gpt2-a100
-#   sky ssh nanochat-gpt2-a100
+#   sky logs nanochat-cluster
+#   sky ssh nanochat-cluster
 #
 # Teardown:
-#   sky down nanochat-gpt2-a100
+#   sky down nanochat-cluster
 #
-# Cost: ~$12/hr, ~5-6 hours runtime => ~$66-78 total
+# Cost: Dependent on accelerator choice (default 8xH100 ~$24/hr)
 
 resources:
-  cloud: runpod
-  accelerators: A100-80GB:8
+  # cloud: runpod  # Commented out - let SkyPilot search all clouds for availability
+  accelerators: H100:8
   disk_size: 200
 
 envs:
@@ -66,13 +66,11 @@ run: |
   source .venv/bin/activate
   export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
-  WANDB_RUN="nanochat-a100"
+  WANDB_RUN="nanochat-latest"
   NUM_GPUS=${SKYPILOT_NUM_GPUS_PER_NODE:-8}
 
-  # Log in to wandb and HuggingFace
-  if [ -n "$WANDB_API_KEY" ]; then
-    wandb login "$WANDB_API_KEY"
-  else
+  # Set up wandb (export WANDB_API_KEY is enough, no need for `wandb login`)
+  if [ -z "$WANDB_API_KEY" ]; then
     WANDB_RUN=dummy
   fi
   if [ -n "$HF_TOKEN" ]; then
@@ -98,12 +96,13 @@ run: |
   python -m scripts.tok_eval
   upload_to_hf "tokenizer"
 
-  # 3. Base model pretraining (no --fp8: A100 is Ampere, no FP8 support)
+  # 3. Base model pretraining (with --fp8: H100 supports FP8)
   torchrun --standalone --nproc_per_node=$NUM_GPUS \
     -m scripts.base_train -- \
     --depth=26 \
     --target-param-data-ratio=8.25 \
     --device-batch-size=16 \
+    --fp8 \
     --run=$WANDB_RUN
   upload_to_hf "base_train"
 
